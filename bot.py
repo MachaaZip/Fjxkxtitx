@@ -19,6 +19,7 @@ import asyncio
 import logging
 import requests
 import urllib3
+from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from copy import deepcopy
 from typing import Any, Dict, List, Optional, Tuple
@@ -85,9 +86,28 @@ GAME_HEADERS = {
     "X-Unity-Version": "2022.3.62f2",
 }
 
+# ═══════════════════════════════════════════════════════════
+# 👑 ADMIN & MEMBERSHIP SETTINGS
+# ═══════════════════════════════════════════════════════════
+
+ADMIN_ID = 8882473760
+CONTACT_USERNAME = "@derincpm"
+
+PRIM_1_MONTH = 350
+PRIM_2_MONTH = 600
+VIP_1_MONTH = 500
+VIP_2_MONTH = 900
+
+PRIM_DAILY_LIMIT = 2
+VIP_DAILY_LIMIT = 999999
+
 DB_DIR = os.path.expanduser("~/.cpm1_termux")
 os.makedirs(DB_DIR, exist_ok=True)
 DB_PATH = os.path.join(DB_DIR, "cpm_tokens.db")
+
+# Sonuç dosyaları buraya kaydedilir: ~/.cpm1_termux/results/<user_id>/
+RESULTS_DIR = os.path.join(DB_DIR, "results")
+os.makedirs(RESULTS_DIR, exist_ok=True)
 
 http_session = requests.Session()
 http_session.verify = True
@@ -1409,24 +1429,178 @@ def cpm1_save_car_status(auth, fuid, car_entries, nuker=None):
 
 
 # ═══════════════════════════════════════════════════════════
-# 🤖 TELEGRAM BOT
+# 👑 MEMBERSHIP DATABASE
 # ═══════════════════════════════════════════════════════════
 
+class MembershipDB:
+    def __init__(self, db_path: str = DB_PATH):
+        self.db_path = db_path
+        self._init_db()
+
+    def _init_db(self):
+        with sqlite3.connect(self.db_path) as c:
+            c.execute("""CREATE TABLE IF NOT EXISTS memberships (
+                user_id INTEGER PRIMARY KEY,
+                tier TEXT DEFAULT 'none',
+                expires_at REAL DEFAULT 0,
+                daily_count INTEGER DEFAULT 0,
+                last_reset TEXT DEFAULT '',
+                added_by INTEGER DEFAULT 0,
+                added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )""")
+            c.commit()
+
+    def _today(self) -> str:
+        return datetime.utcnow().strftime("%Y-%m-%d")
+
+    def _reset_daily_if_needed(self, user_id: int):
+        today = self._today()
+        with sqlite3.connect(self.db_path) as c:
+            row = c.execute(
+                "SELECT last_reset FROM memberships WHERE user_id=?", (user_id,)
+            ).fetchone()
+            if row and row[0] != today:
+                c.execute(
+                    "UPDATE memberships SET daily_count=0, last_reset=? WHERE user_id=?",
+                    (today, user_id)
+                )
+                c.commit()
+
+    def get_membership(self, user_id: int) -> Optional[Dict[str, Any]]:
+        with sqlite3.connect(self.db_path) as c:
+            row = c.execute(
+                "SELECT tier, expires_at, daily_count, last_reset FROM memberships WHERE user_id=?",
+                (user_id,)
+            ).fetchone()
+        if not row:
+            return None
+        tier, expires_at, daily_count, last_reset = row
+        if expires_at and time.time() > expires_at:
+            with sqlite3.connect(self.db_path) as c:
+                c.execute("UPDATE memberships SET tier='none', expires_at=0 WHERE user_id=?", (user_id,))
+                c.commit()
+            return {"tier": "none", "expires_at": 0, "daily_count": daily_count, "last_reset": last_reset}
+        return {"tier": tier or "none", "expires_at": expires_at or 0,
+                "daily_count": daily_count or 0, "last_reset": last_reset or ""}
+
+    def is_prim(self, user_id: int) -> bool:
+        m = self.get_membership(user_id)
+        return bool(m and m["tier"] == "prim")
+
+    def is_vip(self, user_id: int) -> bool:
+        m = self.get_membership(user_id)
+        return bool(m and m["tier"] == "vip")
+
+    def is_member(self, user_id: int) -> bool:
+        return self.is_prim(user_id) or self.is_vip(user_id)
+
+    def get_daily_count(self, user_id: int) -> int:
+        self._reset_daily_if_needed(user_id)
+        with sqlite3.connect(self.db_path) as c:
+            row = c.execute(
+                "SELECT daily_count FROM memberships WHERE user_id=?", (user_id,)
+            ).fetchone()
+        return row[0] if row else 0
+
+    def increment_daily_count(self, user_id: int, amount: int = 1):
+        self._reset_daily_if_needed(user_id)
+        today = self._today()
+        with sqlite3.connect(self.db_path) as c:
+            c.execute(
+                """INSERT INTO memberships (user_id, daily_count, last_reset)
+                   VALUES (?, ?, ?)
+                   ON CONFLICT(user_id) DO UPDATE SET
+                   daily_count = daily_count + ?,
+                   last_reset = ?
+                """,
+                (user_id, amount, today, amount, today)
+            )
+            c.commit()
+
+    def can_clone(self, user_id: int) -> Tuple[bool, str, int]:
+        m = self.get_membership(user_id)
+        if not m or m["tier"] == "none":
+            return False, "NOT_MEMBER", 0
+        tier = m["tier"]
+        if tier == "vip":
+            return True, "VIP", 999999
+        if tier == "prim":
+            self._reset_daily_if_needed(user_id)
+            used = self.get_daily_count(user_id)
+            remaining = PRIM_DAILY_LIMIT - used
+            if remaining <= 0:
+                return False, "DAILY_LIMIT", 0
+            return True, "PRIM", remaining
+        return False, "UNKNOWN", 0
+
+    def add_membership(self, user_id: int, tier: str, months: int = 1, added_by: int = 0) -> Dict[str, Any]:
+        tier = (tier or "none").lower()
+        if tier not in ("prim", "vip", "none"):
+            return {"ok": False, "message": "INVALID_TIER"}
+        now = time.time()
+        current = self.get_membership(user_id)
+        base = now
+        if current and current.get("expires_at") and current["expires_at"] > now:
+            base = current["expires_at"]
+        expires_at = base + (months * 30 * 24 * 3600)
+        if tier == "none":
+            expires_at = 0
+        with sqlite3.connect(self.db_path) as c:
+            c.execute(
+                """INSERT INTO memberships (user_id, tier, expires_at, daily_count, last_reset, added_by)
+                   VALUES (?, ?, ?, 0, ?, ?)
+                   ON CONFLICT(user_id) DO UPDATE SET
+                   tier=?, expires_at=?, daily_count=0, last_reset=?, added_by=?
+                """,
+                (user_id, tier, expires_at, self._today(), added_by,
+                 tier, expires_at, self._today(), added_by)
+            )
+            c.commit()
+        return {"ok": True, "tier": tier, "expires_at": expires_at, "months": months}
+
+    def remove_membership(self, user_id: int) -> bool:
+        with sqlite3.connect(self.db_path) as c:
+            c.execute("UPDATE memberships SET tier='none', expires_at=0 WHERE user_id=?", (user_id,))
+            c.commit()
+        return True
+
+    def list_members(self) -> List[Dict[str, Any]]:
+        now = time.time()
+        with sqlite3.connect(self.db_path) as c:
+            rows = c.execute(
+                """SELECT user_id, tier, expires_at, daily_count, last_reset, added_by, added_at
+                   FROM memberships WHERE tier != 'none' AND expires_at > ?
+                   ORDER BY tier DESC, expires_at ASC""",
+                (now,)
+            ).fetchall()
+        return [
+            {"user_id": r[0], "tier": r[1], "expires_at": r[2], "daily_count": r[3],
+             "last_reset": r[4], "added_by": r[5], "added_at": r[6]}
+            for r in rows
+        ]
+
+    def get_stats(self) -> Dict[str, Any]:
+        now = time.time()
+        with sqlite3.connect(self.db_path) as c:
+            total = c.execute("SELECT COUNT(*) FROM memberships WHERE tier != 'none' AND expires_at > ?", (now,)).fetchone()[0]
+            prim = c.execute("SELECT COUNT(*) FROM memberships WHERE tier='prim' AND expires_at > ?", (now,)).fetchone()[0]
+            vip = c.execute("SELECT COUNT(*) FROM memberships WHERE tier='vip' AND expires_at > ?", (now,)).fetchone()[0]
+        return {"total": total, "prim": prim, "vip": vip}
+
+
+membership_db = MembershipDB(DB_PATH)
 nuker = CPM1(DB_PATH)
 
 # Conversation states
 (EMAIL, PASSWORD, COUNT, SPEED, CONFIRM) = range(5)
 
-# Active jobs to prevent overlapping
 ACTIVE_JOBS = {}
 
 
 def md_escape(text) -> str:
-    """Escape all MarkdownV2 reserved characters."""
     if text is None:
         return ""
     text = str(text)
-    # MarkdownV2 reserved: _ * [ ] ( ) ~ ` > # + - = | { } . !
     escape_chars = r'_*[]()~`>#+-=|{}.!'
     out = []
     for ch in text:
@@ -1440,7 +1614,6 @@ def md_escape(text) -> str:
 
 
 async def send_md(bot, chat_id, text, reply_markup=None, edit_message_id=None):
-    """Send or edit a MarkdownV2 message safely."""
     try:
         if edit_message_id:
             return await bot.edit_message_text(
@@ -1458,7 +1631,6 @@ async def send_md(bot, chat_id, text, reply_markup=None, edit_message_id=None):
         )
     except Exception as e:
         logger.warning(f"send_md failed: {e}")
-        # Fallback: send as plain text
         try:
             plain = re.sub(r'\\(.)', r'\1', text)
             if edit_message_id:
@@ -1478,27 +1650,167 @@ async def send_md(bot, chat_id, text, reply_markup=None, edit_message_id=None):
             return None
 
 
+def is_admin(user_id: int) -> bool:
+    return int(user_id) == int(ADMIN_ID)
+
+
+def membership_required_message():
+    return (
+        "🔒 *ÜYELİK GEREKLİ*\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        "❌ Bu botu kullanmak için *PRIM* veya *VIP* üyeliğiniz olması gerekmektedir\\.\n\n"
+        "💎 *PRIM Üyelik:*\n"
+        f"• 1 Ay: `{PRIM_1_MONTH} TL`\n"
+        f"• 2 Ay: `{PRIM_2_MONTH} TL`\n"
+        f"• Günlük max *{PRIM_DAILY_LIMIT} hesap* klonlama\n\n"
+        "👑 *VIP Üyelik:*\n"
+        f"• 1 Ay: `{VIP_1_MONTH} TL`\n"
+        f"• 2 Ay: `{VIP_2_MONTH} TL`\n"
+        "• *Sınırsız* klonlama\n\n"
+        f"📞 Satın almak için: {md_escape(CONTACT_USERNAME)}\n\n"
+        "_Üyeliğiniz bulunmaktadır " + md_escape(CONTACT_USERNAME) + " ile iletişime geçin_"
+    )
+
+
+def get_user_results_dir(user_id: int) -> str:
+    """Her kullanıcı için ayrı sonuç klasörü döndürür."""
+    user_dir = os.path.join(RESULTS_DIR, str(user_id))
+    os.makedirs(user_dir, exist_ok=True)
+    return user_dir
+
+
+def save_user_result_file(user_id: int, content: str) -> str:
+    """Kullanıcıya özel sonuç dosyası kaydeder, tam yolu döndürür."""
+    user_dir = get_user_results_dir(user_id)
+    filename = f"cloned_accounts_{int(time.time())}.txt"
+    path = os.path.join(user_dir, filename)
+    # Çakışma olursa ek suffix
+    counter = 1
+    while os.path.exists(path):
+        filename = f"cloned_accounts_{int(time.time())}_{counter}.txt"
+        path = os.path.join(user_dir, filename)
+        counter += 1
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(content)
+    return path
+
+
+# ═══════════════════════════════════════════════════════════
+# 🤖 TELEGRAM BOT COMMANDS
+# ═══════════════════════════════════════════════════════════
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
+    user_id = user.id
+
+    if is_admin(user_id):
+        name = md_escape(user.first_name or "Admin")
+        text = (
+            "👑 *ADMIN PANELİ* 👑\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+            f"Hoş geldin *{name}*\\!\n\n"
+            "📋 *Admin Komutları:*\n"
+            "• /clone \\- Klon başlat\n"
+            "• /saved \\- Sonuçları görüntüle\n"
+            "• /admin \\- Admin paneli\n"
+            "• /addmember \\- Üye ekle\n"
+            "• /removemember \\- Üye çıkar\n"
+            "• /members \\- Üyeleri listele\n"
+            "• /stats \\- İstatistikler\n"
+            "• /cancel \\- İptal\n\n"
+            "💎 PRIM: Günlük max 2 hesap\n"
+            "👑 VIP: Sınırsız"
+        )
+        await send_md(context.bot, update.effective_chat.id, text)
+        return
+
+    if not membership_db.is_member(user_id):
+        text = (
+            "🚗 *CPM1 CLONE BOT* 🚗\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+            "❌ Bu botu kullanmak için üyeliğiniz bulunmamaktadır\\.\n\n"
+            f"📞 Üyelik için: {md_escape(CONTACT_USERNAME)}\n\n"
+            "_Üyeliğiniz bulunmaktadır " + md_escape(CONTACT_USERNAME) + " ile iletişime geçin_"
+        )
+        await send_md(context.bot, update.effective_chat.id, text)
+        return
+
+    m = membership_db.get_membership(user_id)
+    tier = m["tier"] if m else "none"
+    tier_icon = "💎" if tier == "prim" else "👑"
+    tier_name = "PRIM" if tier == "prim" else "VIP"
     name = md_escape(user.first_name or "Kullanıcı")
+
+    if tier == "prim":
+        used = membership_db.get_daily_count(user_id)
+        remaining = max(0, PRIM_DAILY_LIMIT - used)
+        tier_info = f"Günlük kalan: `{remaining}/{PRIM_DAILY_LIMIT}`"
+    else:
+        tier_info = "Sınırsız klonlama"
+
     text = (
-        "🚗 *CPM1 BULK CLONE BOT* 🚗\n"
+        f"{tier_icon} *{tier_name} ÜYE* {tier_icon}\n"
         "━━━━━━━━━━━━━━━━━━━━━━━\n\n"
         f"Merhaba *{name}*\\!\n\n"
-        "Bu bot, *CPM1* \\(Car Parking Multiplayer\\) hesaplarını "
-        "toplu olarak klonlamanıza olanak tanır\\.\n\n"
+        f"💎 Üyelik: *{tier_name}*\n"
+        f"📊 {tier_info}\n\n"
         "📋 *Komutlar:*\n"
-        "• /clone \\- Yeni toplu klon başlat\n"
-        "• /saved \\- Kayıtlı sonuçları görüntüle\n"
-        "• /cancel \\- İşlemi iptal et\n"
-        "• /help \\- Yardım\n\n"
-        "⚠️ _Bu bot eğitim amaçlıdır\\._\n"
-        "_Kendi hesaplarınızda kullanın\\._"
+        "• /clone \\- Yeni klon başlat\n"
+        "• /saved \\- Sonuçları görüntüle\n"
+        "• /profile \\- Üyelik bilgilerim\n"
+        "• /cancel \\- İptal"
+    )
+    await send_md(context.bot, update.effective_chat.id, text)
+
+
+async def profile_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if is_admin(user_id):
+        await start(update, context)
+        return
+    m = membership_db.get_membership(user_id)
+    if not m or m["tier"] == "none":
+        await send_md(context.bot, update.effective_chat.id, membership_required_message())
+        return
+
+    tier = m["tier"]
+    tier_name = "PRIM" if tier == "prim" else "VIP"
+    tier_icon = "💎" if tier == "prim" else "👑"
+
+    expires = m.get("expires_at", 0)
+    if expires > 0:
+        remaining_days = max(0, int((expires - time.time()) / 86400))
+        expiry_text = f"{remaining_days} gün"
+        expiry_date = datetime.fromtimestamp(expires).strftime("%Y-%m-%d %H:%M")
+    else:
+        expiry_text = "Süresiz"
+        expiry_date = "-"
+
+    if tier == "prim":
+        used = membership_db.get_daily_count(user_id)
+        remaining = max(0, PRIM_DAILY_LIMIT - used)
+        daily_text = f"`{used}/{PRIM_DAILY_LIMIT}` (kalan: `{remaining}`)"
+    else:
+        daily_text = "Sınırsız"
+
+    text = (
+        f"{tier_icon} *ÜYELİK BİLGİLERİM*\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"👤 ID: `{user_id}`\n"
+        f"💎 Üyelik: *{tier_name}*\n"
+        f"⏱️ Kalan Süre: *{expiry_text}*\n"
+        f"📅 Bitiş: `{expiry_date}`\n"
+        f"📊 Bugünkü Kullanım: {daily_text}"
     )
     await send_md(context.bot, update.effective_chat.id, text)
 
 
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if not is_admin(user_id) and not membership_db.is_member(user_id):
+        await send_md(context.bot, update.effective_chat.id, membership_required_message())
+        return
+
     text = (
         "📖 *YARDIM*\n"
         "━━━━━━━━━━━━━━━━━━━━━━━\n\n"
@@ -1506,7 +1818,7 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "1\\. `/clone` komutunu gönder\n"
         "2\\. Kaynak hesabın e\\-postasını gir\n"
         "3\\. Kaynak hesabın şifresini gir\n"
-        "4\\. Kaç hesap oluşturulacağını gir \\(1\\-100\\)\n"
+        "4\\. Kaç hesap oluşturulacağını gir\n"
         "5\\. Hız modunu seç\n"
         "6\\. Onayla ve bekle\n\n"
         "*Hız Modları:*\n"
@@ -1514,7 +1826,7 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "⚡ Hızlı \\- 15 worker\n"
         "🚀 Turbo \\- 30 worker\n"
         "💥 Max \\- 50 worker\n\n"
-        "*Not:* İşlem sırasında bot meşgul olabilir\\."
+        "*Not:* PRIM üyeler günde max 2 hesap klonlayabilir\\."
     )
     await send_md(context.bot, update.effective_chat.id, text)
 
@@ -1531,6 +1843,22 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def clone_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
+
+    if not is_admin(user_id):
+        allowed, reason, remaining = membership_db.can_clone(user_id)
+        if not allowed:
+            if reason == "NOT_MEMBER":
+                await send_md(context.bot, update.effective_chat.id, membership_required_message())
+            elif reason == "DAILY_LIMIT":
+                await send_md(
+                    context.bot,
+                    update.effective_chat.id,
+                    f"⏰ *GÜNLÜK LİMİT DOLDU\\!*\n\n"
+                    f"💎 PRIM üyeler günde max *{PRIM_DAILY_LIMIT} hesap* klonlayabilir\\.\n\n"
+                    f"Yarın tekrar deneyin veya *VIP* üyeliğe geçin\\.",
+                )
+            return ConversationHandler.END
+
     if user_id in ACTIVE_JOBS:
         await send_md(
             context.bot,
@@ -1579,34 +1907,82 @@ async def clone_password(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return PASSWORD
     context.user_data["src_pass"] = password
-    # Try to delete the password message for privacy
     try:
         await update.message.delete()
     except Exception:
         pass
+
+    user_id = update.effective_user.id
+    max_count = 100
+    limit_note = ""
+    if not is_admin(user_id):
+        allowed, reason, remaining = membership_db.can_clone(user_id)
+        if allowed and reason == "PRIM":
+            max_count = min(remaining, 100)
+            limit_note = f"\n💎 PRIM günlük kalan: *{remaining}* hesap"
+
     await send_md(
         context.bot,
         update.effective_chat.id,
-        "🔢 *Kaç Hesap Oluşturulsun?* \\(1\\-100\\)\n\n"
-        "Örnek: `5`\n\n"
+        f"🔢 *Kaç Hesap Oluşturulsun?* \\(1\\-{max_count}\\){limit_note}\n\n"
+        f"Örnek: `{min(5, max_count)}`\n\n"
         "İptal için /cancel",
     )
     return COUNT
 
 
 async def clone_count(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    max_count = 100
+    if not is_admin(user_id):
+        allowed, reason, remaining = membership_db.can_clone(user_id)
+        if allowed and reason == "PRIM":
+            max_count = min(remaining, 100)
+        elif not allowed:
+            await send_md(context.bot, update.effective_chat.id, membership_required_message())
+            return ConversationHandler.END
+
     try:
         count = int((update.message.text or "").strip())
-        if count < 1 or count > 100:
+        if count < 1 or count > max_count:
             raise ValueError
     except ValueError:
         await send_md(
             context.bot,
             update.effective_chat.id,
-            "❌ *Geçersiz sayı\\!* 1\\-100 arası bir değer girin:",
+            f"❌ *Geçersiz sayı\\!* 1\\-{max_count} arası bir değer girin:",
         )
         return COUNT
     context.user_data["count"] = count
+
+    if not is_admin(user_id):
+        allowed, reason, remaining = membership_db.can_clone(user_id)
+        if allowed and reason == "PRIM":
+            context.user_data["workers"] = 5
+            src_email = context.user_data.get("src_email", "")
+            keyboard = [
+                [
+                    InlineKeyboardButton("✅ Başlat", callback_data="confirm_yes"),
+                    InlineKeyboardButton("❌ İptal", callback_data="confirm_no"),
+                ]
+            ]
+            text = (
+                "📋 *ÖZET*\n"
+                "━━━━━━━━━━━━━━━━━━━━━━━\n"
+                f"💎 Üyelik: *PRIM*\n"
+                f"📧 Kaynak: `{md_escape(src_email)}`\n"
+                f"🔢 Hesap Sayısı: `{count}`\n"
+                f"⚡ Hız: *Güvenli* \\(5 worker\\)\n\n"
+                "_PRIM üyeler güvenli modda klonlanır\\._\n\n"
+                "Onaylıyor musunuz?"
+            )
+            await send_md(
+                context.bot,
+                update.effective_chat.id,
+                text,
+                reply_markup=InlineKeyboardMarkup(keyboard),
+            )
+            return CONFIRM
 
     keyboard = [
         [InlineKeyboardButton("🐢 Güvenli (5 worker)", callback_data="speed_5")],
@@ -1686,18 +2062,32 @@ async def clone_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     message_id = query.message.message_id
 
+    if not is_admin(user_id):
+        allowed, reason, remaining = membership_db.can_clone(user_id)
+        if not allowed:
+            context.user_data.clear()
+            if reason == "DAILY_LIMIT":
+                await send_md(
+                    context.bot,
+                    chat_id,
+                    f"⏰ *GÜNLÜK LİMİT DOLDU\\!*\n\nPRIM üyeler günde max *{PRIM_DAILY_LIMIT} hesap* klonlayabilir\\.",
+                    edit_message_id=message_id,
+                )
+            else:
+                await send_md(context.bot, chat_id, membership_required_message())
+            return ConversationHandler.END
+        if reason == "PRIM" and count > remaining:
+            count = remaining
+
     await send_md(
         context.bot,
         chat_id,
-        "⏳ *İşlem Başlatılıyor\\.\\.\\.*\n\n"
-        "Kaynak hesaba giriş yapılıyor\\.",
+        "⏳ *İşlem Başlatılıyor\\.\\.\\.*\n\nKaynak hesaba giriş yapılıyor\\.",
         edit_message_id=message_id,
     )
 
-    # Mark job as active
     ACTIVE_JOBS[user_id] = True
 
-    # Run in background
     asyncio.create_task(
         run_clone(
             bot=context.bot,
@@ -1714,7 +2104,12 @@ async def clone_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def run_clone(bot, chat_id, message_id, user_id, src_email, src_pass, count, workers):
-    """Run the clone process in background and update the user."""
+    is_admin_user = is_admin(user_id)
+    is_prim = False
+    if not is_admin_user:
+        m = membership_db.get_membership(user_id)
+        if m and m["tier"] == "prim":
+            is_prim = True
 
     async def status(text, edit=True):
         if edit:
@@ -1767,7 +2162,6 @@ async def run_clone(bot, chat_id, message_id, user_id, src_email, src_pass, coun
         last_update_time = [0.0]
 
         def safe_edit_progress(text):
-            """Thread-safe progress update via asyncio.run_coroutine_threadsafe."""
             now = time.time()
             if now - last_update_time[0] < 2.0:
                 return
@@ -1786,13 +2180,12 @@ async def run_clone(bot, chat_id, message_id, user_id, src_email, src_pass, coun
 
         def clone_one_account(index):
             try:
-                stamp = int(time.time() * 1000)
-                rand_part = random.randint(100000, 999999)
-                new_email = f"yarasaClone_{stamp}_{index}_{rand_part}@gmail.com"
+                rand_num = random.randint(10000000, 99999999)
+                new_email = f"derin{rand_num}@gmail.com"
                 new_password = ''.join(
-                    random.choice(string.ascii_letters + string.digits) for _ in range(12)
+                    random.choice(string.ascii_letters + string.digits) for _ in range(15)
                 )
-                new_name = f"Player{index + 1}_{rand_part}"
+                new_name = f"Player{index + 1}_{rand_num}"
 
                 create_result = nuker.create_account(new_email, new_password, new_name)
                 if not create_result.get("ok"):
@@ -1849,7 +2242,6 @@ async def run_clone(bot, chat_id, message_id, user_id, src_email, src_pass, coun
                     ok = counter["ok"]
                     fail = counter["fail"]
 
-                # Progress update
                 safe_edit_progress(
                     f"🚀 *İlerleme:* `{done}/{count}`\n"
                     f"✅ Başarılı: `{ok}`\n"
@@ -1895,29 +2287,36 @@ async def run_clone(bot, chat_id, message_id, user_id, src_email, src_pass, coun
         created = await loop.run_in_executor(None, run_all)
         elapsed = time.time() - start_time
 
+        if is_prim:
+            membership_db.increment_daily_count(user_id, count)
+
         if created:
             created.sort(key=lambda x: x.get("index", 0))
 
-            save_path = os.path.join(DB_DIR, f"cloned_accounts_{int(time.time())}.txt")
-            with open(save_path, "w", encoding="utf-8") as f:
-                f.write("═" * 60 + "\n")
-                f.write("CPM1 BULK CLONE RESULTS (TURBO)\n")
-                f.write(f"Tarih: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
-                f.write(f"Toplam: {len(created)} hesap\n")
-                f.write(f"Kaynak Araba: {len(source_cars)}\n")
-                f.write(f"Worker: {workers}\n")
-                f.write(f"Süre: {elapsed:.1f} saniye\n")
-                f.write("═" * 60 + "\n\n")
+            # ✅ Kullanıcıya özel klasöre kaydet
+            content_lines = []
+            content_lines.append("═" * 60)
+            content_lines.append("CPM1 BULK CLONE RESULTS")
+            content_lines.append(f"Tarih: {time.strftime('%Y-%m-%d %H:%M:%S')}")
+            content_lines.append(f"Toplam: {len(created)} hesap")
+            content_lines.append(f"Kaynak Araba: {len(source_cars)}")
+            content_lines.append(f"Worker: {workers}")
+            content_lines.append(f"Süre: {elapsed:.1f} saniye")
+            content_lines.append("═" * 60)
+            content_lines.append("")
 
-                for i, acc in enumerate(created, 1):
-                    f.write(f"[{i}] Account\n")
-                    f.write(f"  Email:    {acc['email']}\n")
-                    f.write(f"  Password: {acc['password']}\n")
-                    f.write(f"  Name:     {acc['name']}\n")
-                    f.write(f"  ID:       {acc['id']}\n")
-                    f.write(f"  Cars:     {acc['cars']}\n")
-                    if i < len(created):
-                        f.write("\n")
+            for i, acc in enumerate(created, 1):
+                content_lines.append(f"[{i}] Account")
+                content_lines.append(f"  Email:    {acc['email']}")
+                content_lines.append(f"  Password: {acc['password']}")
+                content_lines.append(f"  Name:     {acc['name']}")
+                content_lines.append(f"  ID:       {acc['id']}")
+                content_lines.append(f"  Cars:     {acc['cars']}")
+                if i < len(created):
+                    content_lines.append("")
+
+            content = "\n".join(content_lines)
+            save_path = save_user_result_file(user_id, content)
 
             avg = elapsed / len(created) if created else 0
             summary = (
@@ -1964,41 +2363,93 @@ async def run_clone(bot, chat_id, message_id, user_id, src_email, src_pass, coun
             pass
     finally:
         ACTIVE_JOBS.pop(user_id, None)
-        try:
-            context_user_data_clear = None
-        except Exception:
-            pass
 
 
 async def saved_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Sadece kullanıcının KENDİ sonuçlarını gösterir. Admin tüm kullanıcıları görebilir."""
+    user_id = update.effective_user.id
+    if not is_admin(user_id) and not membership_db.is_member(user_id):
+        await send_md(context.bot, update.effective_chat.id, membership_required_message())
+        return
+
     try:
+        # ✅ Kullanıcı sadece kendi klasörünü görür
+        if is_admin(user_id):
+            # Admin: tüm kullanıcıların sonuçlarını listeleyebilir
+            all_files = []
+            if os.path.isdir(RESULTS_DIR):
+                for uid_dir in os.listdir(RESULTS_DIR):
+                    full_dir = os.path.join(RESULTS_DIR, uid_dir)
+                    if not os.path.isdir(full_dir):
+                        continue
+                    for f in os.listdir(full_dir):
+                        if f.endswith(".txt") and f.startswith("cloned_accounts_"):
+                            path = os.path.join(full_dir, f)
+                            all_files.append((path, uid_dir, f))
+            if not all_files:
+                await send_md(
+                    context.bot,
+                    update.effective_chat.id,
+                    "📭 *Kayıtlı sonuç yok\\.*",
+                )
+                return
+            # En yeni 15 dosya
+            all_files.sort(key=lambda x: os.path.getmtime(x[0]), reverse=True)
+            all_files = all_files[:15]
+            keyboard = []
+            for path, uid_dir, f in all_files:
+                size = os.path.getsize(path)
+                label = f"👤 {uid_dir} | {f.replace('cloned_accounts_', '').replace('.txt', '')} ({size} B)"
+                # callback_data max 64 byte, dosya adı + kullanıcı ID sığmalı
+                cb = f"file_{uid_dir}_{f}"
+                if len(cb.encode('utf-8')) > 64:
+                    # Çok uzunsa kısalt
+                    cb = f"file_{uid_dir}_{f}"[:64]
+                keyboard.append([InlineKeyboardButton(label, callback_data=cb)])
+            await send_md(
+                context.bot,
+                update.effective_chat.id,
+                "📂 *Tüm Kullanıcı Sonuçları* \\(admin\\):\n\nBirini seçin:",
+                reply_markup=InlineKeyboardMarkup(keyboard),
+            )
+            return
+
+        # Normal kullanıcı: sadece kendi klasörü
+        user_dir = get_user_results_dir(user_id)
         files = [
-            f for f in os.listdir(DB_DIR)
+            f for f in os.listdir(user_dir)
             if f.endswith(".txt") and f.startswith("cloned_accounts_")
         ]
         if not files:
             await send_md(
                 context.bot,
                 update.effective_chat.id,
-                "📭 *Kayıtlı sonuç yok\\.*",
+                "📭 *Kayıtlı sonucunuz yok\\.*\n\n"
+                "Önce `/clone` komutu ile hesap oluşturun\\.",
             )
             return
 
-        files.sort(reverse=True)
-        files = files[:10]
+        # En yeni önce
+        files_with_time = []
+        for f in files:
+            path = os.path.join(user_dir, f)
+            files_with_time.append((f, os.path.getmtime(path), os.path.getsize(path)))
+        files_with_time.sort(key=lambda x: x[1], reverse=True)
+        files_with_time = files_with_time[:10]
 
         keyboard = []
-        for f in files:
-            path = os.path.join(DB_DIR, f)
-            size = os.path.getsize(path)
-            label = f.replace('cloned_accounts_', '').replace('.txt', '')
-            label = f"{label} ({size} B)"
-            keyboard.append([InlineKeyboardButton(label, callback_data=f"file_{f}")])
+        for f, mtime, size in files_with_time:
+            date_str = datetime.fromtimestamp(mtime).strftime("%Y-%m-%d %H:%M")
+            label = f"{date_str} ({size} B)"
+            cb = f"file_{user_id}_{f}"
+            if len(cb.encode('utf-8')) > 64:
+                cb = cb[:64]
+            keyboard.append([InlineKeyboardButton(label, callback_data=cb)])
 
         await send_md(
             context.bot,
             update.effective_chat.id,
-            "📂 *Son Sonuçlar:*\n\nBirini seçin:",
+            "📂 *Kendi Sonuçlarınız:*\n\nBirini seçin:",
             reply_markup=InlineKeyboardMarkup(keyboard),
         )
     except Exception as e:
@@ -2010,15 +2461,63 @@ async def saved_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def file_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Dosya gönderir. Kullanıcı sadece kendi dosyasını indirebilir."""
     query = update.callback_query
     await query.answer()
     data = query.data or ""
     if not data.startswith("file_"):
         return
-    filename = data[5:]
-    # Sanitize
-    filename = os.path.basename(filename)
-    path = os.path.join(DB_DIR, filename)
+
+    user_id = update.effective_user.id
+    if not is_admin(user_id) and not membership_db.is_member(user_id):
+        await send_md(context.bot, update.effective_chat.id, membership_required_message())
+        return
+
+    # data = "file_<owner_uid>_<filename>"
+    rest = data[5:]  # file_ sonrası
+    # İlk parça owner uid olmalı (sayı)
+    parts = rest.split("_", 1)
+    if len(parts) != 2:
+        await send_md(
+            context.bot,
+            update.effective_chat.id,
+            "❌ *Geçersiz dosya\\.*",
+        )
+        return
+    try:
+        owner_uid = int(parts[0])
+    except ValueError:
+        await send_md(
+            context.bot,
+            update.effective_chat.id,
+            "❌ *Geçersiz dosya sahibi\\.*",
+        )
+        return
+    filename = os.path.basename(parts[1])
+
+    # ✅ Güvenlik: kullanıcı sadece KENDİ dosyasını indirebilir
+    if not is_admin(user_id) and owner_uid != user_id:
+        await send_md(
+            context.bot,
+            update.effective_chat.id,
+            "⛔ *Bu dosya size ait değil\\!*",
+        )
+        return
+
+    owner_dir = os.path.join(RESULTS_DIR, str(owner_uid))
+    path = os.path.join(owner_dir, filename)
+
+    # Path traversal koruması
+    real_path = os.path.realpath(path)
+    real_owner = os.path.realpath(owner_dir)
+    if not real_path.startswith(real_owner):
+        await send_md(
+            context.bot,
+            update.effective_chat.id,
+            "❌ *Geçersiz dosya yolu\\.*",
+        )
+        return
+
     if not os.path.exists(path):
         await send_md(
             context.bot,
@@ -2026,6 +2525,7 @@ async def file_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "❌ *Dosya bulunamadı\\.*",
         )
         return
+
     try:
         with open(path, "rb") as doc:
             await context.bot.send_document(
@@ -2047,6 +2547,258 @@ async def file_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
 
+# ═══════════════════════════════════════════════════════════
+# 👑 ADMIN COMMANDS
+# ═══════════════════════════════════════════════════════════
+
+def admin_only(func):
+    async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not is_admin(update.effective_user.id):
+            await send_md(
+                context.bot,
+                update.effective_chat.id,
+                "⛔ *Bu komut sadece admin içindir\\!*",
+            )
+            return
+        return await func(update, context)
+    return wrapper
+
+
+@admin_only
+async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    stats = membership_db.get_stats()
+    text = (
+        "👑 *ADMIN PANELİ* 👑\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"📊 *İstatistikler:*\n"
+        f"• Toplam Üye: `{stats['total']}`\n"
+        f"• 💎 PRIM: `{stats['prim']}`\n"
+        f"• 👑 VIP: `{stats['vip']}`\n\n"
+        "📋 *Komutlar:*\n"
+        "• /addmember `user_id` `tier` `ay`\n"
+        "• /removemember `user_id`\n"
+        "• /members \\- Üye listesi\n"
+        "• /memberinfo `user_id`\n"
+        "• /stats \\- İstatistikler\n"
+        "• /broadcast \\- Mesaj gönder\n\n"
+        "*Tier:* `prim` veya `vip`\n"
+        "*Ay:* `1` veya `2`\n\n"
+        f"💰 *Fiyatlar:*\n"
+        f"💎 PRIM: 1 ay `{PRIM_1_MONTH} TL` / 2 ay `{PRIM_2_MONTH} TL`\n"
+        f"👑 VIP: 1 ay `{VIP_1_MONTH} TL` / 2 ay `{VIP_2_MONTH} TL`"
+    )
+    await send_md(context.bot, update.effective_chat.id, text)
+
+
+@admin_only
+async def add_member_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    args = context.args or []
+    if len(args) < 2:
+        await send_md(
+            context.bot,
+            update.effective_chat.id,
+            "❌ *Kullanım:* `/addmember <user_id> <prim|vip> [ay]`\n\n"
+            "Örnek: `/addmember 123456789 prim 1`\n"
+            "Örnek: `/addmember 123456789 vip 2`",
+        )
+        return
+    try:
+        target_id = int(args[0])
+    except ValueError:
+        await send_md(context.bot, update.effective_chat.id, "❌ *Geçersiz user_id\\!*")
+        return
+    tier = args[1].lower()
+    if tier not in ("prim", "vip"):
+        await send_md(context.bot, update.effective_chat.id, "❌ *Tier `prim` veya `vip` olmalı\\!*")
+        return
+    months = 1
+    if len(args) >= 3:
+        try:
+            months = int(args[2])
+        except ValueError:
+            months = 1
+    if months not in (1, 2):
+        await send_md(context.bot, update.effective_chat.id, "❌ *Ay `1` veya `2` olmalı\\!*")
+        return
+
+    result = membership_db.add_membership(target_id, tier, months, added_by=update.effective_user.id)
+    if not result.get("ok"):
+        await send_md(context.bot, update.effective_chat.id, f"❌ Hata: `{md_escape(result.get('message', ''))}`")
+        return
+
+    tier_icon = "💎" if tier == "prim" else "👑"
+    tier_name = "PRIM" if tier == "prim" else "VIP"
+    expires = result.get("expires_at", 0)
+    expiry_date = datetime.fromtimestamp(expires).strftime("%Y-%m-%d %H:%M") if expires else "-"
+
+    await send_md(
+        context.bot,
+        update.effective_chat.id,
+        f"✅ *Üye Eklendi\\!*\n\n"
+        f"{tier_icon} Tier: *{tier_name}*\n"
+        f"👤 User ID: `{target_id}`\n"
+        f"📅 Bitiş: `{expiry_date}`\n"
+        f"⏱️ Süre: `{months}` ay",
+    )
+
+    try:
+        await send_md(
+            context.bot,
+            target_id,
+            f"🎉 *ÜYELİĞİNİZ AKTİF EDİLDİ\\!*\n\n"
+            f"{tier_icon} Üyelik: *{tier_name}*\n"
+            f"📅 Bitiş: `{expiry_date}`\n"
+            f"⏱️ Süre: `{months}` ay\n\n"
+            f"Botu kullanmak için /start yazın\\.",
+        )
+    except Exception:
+        pass
+
+
+@admin_only
+async def remove_member_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    args = context.args or []
+    if len(args) < 1:
+        await send_md(
+            context.bot,
+            update.effective_chat.id,
+            "❌ *Kullanım:* `/removemember <user_id>`",
+        )
+        return
+    try:
+        target_id = int(args[0])
+    except ValueError:
+        await send_md(context.bot, update.effective_chat.id, "❌ *Geçersiz user_id\\!*")
+        return
+
+    membership_db.remove_membership(target_id)
+    await send_md(
+        context.bot,
+        update.effective_chat.id,
+        f"✅ *Üyelik kaldırıldı:* `{target_id}`",
+    )
+    try:
+        await send_md(
+            context.bot,
+            target_id,
+            "❌ *Üyeliğiniz sonlandırıldı\\.*\n\n"
+            f"Bilgi için: {md_escape(CONTACT_USERNAME)}",
+        )
+    except Exception:
+        pass
+
+
+@admin_only
+async def members_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    members = membership_db.list_members()
+    if not members:
+        await send_md(context.bot, update.effective_chat.id, "📭 *Hiç üye yok\\.*")
+        return
+
+    lines = ["👥 *ÜYE LİSTESİ*", "━━━━━━━━━━━━━━━━━━━━━━━", ""]
+    for m in members:
+        tier_icon = "💎" if m["tier"] == "prim" else "👑"
+        tier_name = "PRIM" if m["tier"] == "prim" else "VIP"
+        remaining_days = max(0, int((m["expires_at"] - time.time()) / 86400))
+        expiry_date = datetime.fromtimestamp(m["expires_at"]).strftime("%Y-%m-%d")
+        lines.append(
+            f"{tier_icon} *{tier_name}* \\| `{m['user_id']}`\n"
+            f"   └ Bitiş: `{expiry_date}` \\({remaining_days} gün\\)"
+        )
+    lines.append("")
+    lines.append(f"_Toplam: {len(members)} üye_")
+
+    text = "\n".join(lines)
+    if len(text) > 4000:
+        text = text[:4000] + "\n\n_\\.\\.\\. liste kesildi_"
+    await send_md(context.bot, update.effective_chat.id, text)
+
+
+@admin_only
+async def member_info_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    args = context.args or []
+    if len(args) < 1:
+        await send_md(context.bot, update.effective_chat.id, "❌ *Kullanım:* `/memberinfo <user_id>`")
+        return
+    try:
+        target_id = int(args[0])
+    except ValueError:
+        await send_md(context.bot, update.effective_chat.id, "❌ *Geçersiz user_id\\!*")
+        return
+
+    m = membership_db.get_membership(target_id)
+    if not m or m["tier"] == "none":
+        await send_md(
+            context.bot,
+            update.effective_chat.id,
+            f"❌ `{target_id}` *üye değil\\.*",
+        )
+        return
+
+    tier = m["tier"]
+    tier_icon = "💎" if tier == "prim" else "👑"
+    tier_name = "PRIM" if tier == "prim" else "VIP"
+    remaining_days = max(0, int((m["expires_at"] - time.time()) / 86400))
+    expiry_date = datetime.fromtimestamp(m["expires_at"]).strftime("%Y-%m-%d %H:%M")
+    daily_used = m.get("daily_count", 0)
+
+    text = (
+        f"{tier_icon} *ÜYE BİLGİSİ*\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"👤 ID: `{target_id}`\n"
+        f"💎 Tier: *{tier_name}*\n"
+        f"📅 Bitiş: `{expiry_date}`\n"
+        f"⏱️ Kalan: `{remaining_days}` gün\n"
+        f"📊 Bugünkü Kullanım: `{daily_used}`"
+    )
+    await send_md(context.bot, update.effective_chat.id, text)
+
+
+@admin_only
+async def stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    stats = membership_db.get_stats()
+    text = (
+        "📊 *İSTATİSTİKLER*\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"👥 Toplam Üye: `{stats['total']}`\n"
+        f"💎 PRIM: `{stats['prim']}`\n"
+        f"👑 VIP: `{stats['vip']}`"
+    )
+    await send_md(context.bot, update.effective_chat.id, text)
+
+
+@admin_only
+async def broadcast_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    args = context.args or []
+    if not args:
+        await send_md(
+            context.bot,
+            update.effective_chat.id,
+            "❌ *Kullanım:* `/broadcast <mesaj>`",
+        )
+        return
+    msg = " ".join(args)
+    members = membership_db.list_members()
+    sent = 0
+    failed = 0
+    for m in members:
+        try:
+            await send_md(context.bot, m["user_id"], f"📢 *DUYURU*\n\n{md_escape(msg)}")
+            sent += 1
+            await asyncio.sleep(0.05)
+        except Exception:
+            failed += 1
+    await send_md(
+        context.bot,
+        update.effective_chat.id,
+        f"✅ *Broadcast tamamlandı\\!*\n\n✅ Başarılı: `{sent}`\n❌ Başarısız: `{failed}`",
+    )
+
+
+# ═══════════════════════════════════════════════════════════
+# 🚨 ERROR HANDLER
+# ═══════════════════════════════════════════════════════════
+
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
     logger.error(f"Update {update} caused error {context.error}")
     try:
@@ -2054,7 +2806,6 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
         traceback.print_exception(type(context.error), context.error, context.error.__traceback__)
     except Exception:
         pass
-    # Notify user if possible
     if isinstance(update, Update) and update.effective_chat:
         try:
             await send_md(
@@ -2066,17 +2817,22 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
             pass
 
 
+# ═══════════════════════════════════════════════════════════
+# 🚀 MAIN
+# ═══════════════════════════════════════════════════════════
+
 def main():
     print("╔══════════════════════════════════════════════╗")
-    print("║   CPM1 BULK CLONE - TELEGRAM BOT v1.0       ║")
+    print("║   CPM1 CLONE BOT - PRIM/VIP v2.2            ║")
     print("╚══════════════════════════════════════════════╝")
+    print(f"Admin ID: {ADMIN_ID}")
     print(f"Bot token: {'*' * 10 if BOT_TOKEN else 'YOK!'}")
+    print(f"Sonuç klasörü: {RESULTS_DIR}")
     print()
 
     if not BOT_TOKEN or BOT_TOKEN == "BURAYA_BOT_TOKEN_YAZ":
         print("❌ BOT_TOKEN ayarlanmamış!")
         print("   export BOT_TOKEN='123456:ABC...'")
-        print("   veya kod içindeki BOT_TOKEN değişkenini düzenleyin.")
         sys.exit(1)
 
     app = Application.builder().token(BOT_TOKEN).build()
@@ -2097,12 +2853,33 @@ def main():
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_cmd))
+    app.add_handler(CommandHandler("profile", profile_cmd))
     app.add_handler(conv_handler)
     app.add_handler(CommandHandler("saved", saved_cmd))
     app.add_handler(CallbackQueryHandler(file_callback, pattern=r"^file_"))
+
+    app.add_handler(CommandHandler("admin", admin_panel))
+    app.add_handler(CommandHandler("addmember", add_member_cmd))
+    app.add_handler(CommandHandler("removemember", remove_member_cmd))
+    app.add_handler(CommandHandler("members", members_cmd))
+    app.add_handler(CommandHandler("memberinfo", member_info_cmd))
+    app.add_handler(CommandHandler("stats", stats_cmd))
+    app.add_handler(CommandHandler("broadcast", broadcast_cmd))
+
     app.add_error_handler(error_handler)
 
     print("✅ Bot çalışıyor... Durdurmak için Ctrl+C")
+    print()
+    print("📋 Admin komutları:")
+    print("   /admin - Admin paneli")
+    print("   /addmember <user_id> <prim|vip> [1|2]")
+    print("   /removemember <user_id>")
+    print("   /members - Üye listesi")
+    print("   /memberinfo <user_id>")
+    print("   /stats - İstatistikler")
+    print("   /broadcast <mesaj>")
+    print()
+
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
